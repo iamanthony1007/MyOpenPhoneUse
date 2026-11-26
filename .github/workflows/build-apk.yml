@@ -6,6 +6,9 @@ on:
 permissions:
   contents: read
 
+env:
+  APP_NAME: Thonix
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,12 +23,62 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c
 
+      # Same key on every build, so a new build installs over the old one.
+      - name: Load my signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEBUG_KEYSTORE_B64}" ]; then
+            echo "::error::The secret DEBUG_KEYSTORE_B64 is missing or empty."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "$DEBUG_KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          if ! keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey > /dev/null 2>&1; then
+            echo "::error::The signing key could not be read. Create the secret again from make_signing_key.py."
+            exit 1
+          fi
+          FP=$(keytool -list -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey | awk '/SHA256:/ && !seen {print $2; seen=1}' | tr -d ':' | tr 'A-F' 'a-f')
+          echo "KEY_FINGERPRINT=$FP" >> "$GITHUB_ENV"
+          echo "Signing key loaded. Fingerprint: $FP"
+
+      # The original project's code stays untouched in the repo; the name is applied here.
+      - name: Name the app
+        run: |
+          set -euo pipefail
+          grep -rl 'OpenPhoneUse' app/src/main --include='*.kt' --include='*.xml' \
+            | grep -v -e 'auth/PlanAuth.kt' -e 'mcp/McpOAuth.kt' -e 'settings/LicensesScreen.kt' \
+            | xargs sed -i "s/OpenPhoneUse/${APP_NAME}/g"
+          grep -q "<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>" app/src/main/res/values/strings.xml
+          echo "App named ${APP_NAME}."
+
       - name: Build the app
         run: ./gradlew assembleDebug --console=plain
+
+      - name: Check the app was signed with my key
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          APKSIGNER=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::warning::Could not find the tool that checks the signature, so this check was skipped."
+          else
+            ACTUAL=$("$APKSIGNER" verify --print-certs "$APK" | awk '/certificate SHA-256 digest/ && !seen {print $NF; seen=1}')
+            echo "Expected: $KEY_FINGERPRINT"
+            echo "Actual:   $ACTUAL"
+            if [ "$ACTUAL" != "$KEY_FINGERPRINT" ]; then
+              echo "::error::The app was not signed with my key."
+              exit 1
+            fi
+            echo "Signature matches."
+          fi
+          cp "$APK" "${APP_NAME}.apk"
 
       - name: Save the app file
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: thonix-app
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.APP_NAME }}.apk
           if-no-files-found: error
