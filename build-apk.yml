@@ -1,0 +1,275 @@
+name: Build app for my phone
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: Thonix
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c
+
+      # Same key on every build, so a new build installs over the old one.
+      - name: Load my signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEBUG_KEYSTORE_B64}" ]; then
+            echo "::error::The secret DEBUG_KEYSTORE_B64 is missing or empty."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "$DEBUG_KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          if ! keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey > /dev/null 2>&1; then
+            echo "::error::The signing key could not be read. Create the secret again from make_signing_key.py."
+            exit 1
+          fi
+          FP=$(keytool -list -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey | awk '/SHA256:/ && !seen {print $2; seen=1}' | tr -d ':' | tr 'A-F' 'a-f')
+          echo "KEY_FINGERPRINT=$FP" >> "$GITHUB_ENV"
+          echo "Signing key loaded. Fingerprint: $FP"
+
+      # The original project's code stays untouched in the repo; the name is applied here.
+      - name: Name the app
+        run: |
+          set -euo pipefail
+          grep -rl 'OpenPhoneUse' app/src/main --include='*.kt' --include='*.xml' \
+            | grep -v -e 'auth/PlanAuth.kt' -e 'mcp/McpOAuth.kt' -e 'settings/LicensesScreen.kt' \
+            | xargs sed -i "s/OpenPhoneUse/${APP_NAME}/g"
+          grep -q "<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>" app/src/main/res/values/strings.xml
+          echo "App named ${APP_NAME}."
+
+      # My private lock list: apps Thonix never opens, reads or operates.
+      - name: Attach my lock list
+        env:
+          LOCKED_APPS: ${{ secrets.LOCKED_APPS }}
+        run: |
+          python3 - <<'LOCK_PY'
+          """Adds the owner's lock list to the app's code before it is built.
+
+          Runs on GitHub during the build. The list comes from the LOCKED_APPS secret,
+          so the app names never appear in the public repository or in the build log.
+          Every change is checked: if the app's code has moved and the lock cannot be
+          attached in exactly the expected place, the build stops instead of producing
+          an app without the lock.
+          """
+
+          import os
+          import pathlib
+          import re
+          import sys
+
+          SRC = pathlib.Path("app/src/main/java/com/phoneuse")
+          MIN_WORD = 3
+
+
+          def stop(message: str) -> None:
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def lock_words() -> list[str]:
+              raw = os.environ.get("LOCKED_APPS", "")
+              if not raw.strip():
+                  stop("The secret LOCKED_APPS is missing. Add it (app names separated by commas), or set it to: none")
+              words: list[str] = []
+              for position, part in enumerate(re.split(r"[,;\n]+", raw), start=1):
+                  word = re.sub(r"[^a-z0-9]", "", part.lower())
+                  if not word or word == "none":
+                      continue
+                  if len(word) < MIN_WORD:
+                      stop(f"Entry number {position} in LOCKED_APPS is shorter than {MIN_WORD} letters, which would lock too many apps.")
+                  if word not in words:
+                      words.append(word)
+              return words
+
+
+          OWNER_LOCK = r'''package com.phoneuse.security
+
+          import java.util.concurrent.ConcurrentHashMap
+
+          /**
+           * The owner's lock list: apps the assistant never opens, reads or operates, whatever the model asks.
+           * The words come from the build (see OwnerLockWords). A word locks every app whose package name contains
+           * it, or whose visible name does: inside one part of the name ("MyOPay") or running across parts from the
+           * start of one ("Monie Point"). Case is ignored.
+           */
+          object OwnerLock {
+              /** What the model gets in place of a locked app's screen, and as the refusal to open one. */
+              const val NOTICE =
+                  "LOCKED BY OWNER: the owner put this app on their private lock list, so it is not operated: it is not " +
+                      "opened, its screen is not read and taps, typing and scrolling in it are refused. Do not try other " +
+                      "ways in (no links, no search, no other app that reaches the same account). Finish now: tell the " +
+                      "user this app is on their lock list, so they need to do this part themselves, and give them " +
+                      "whatever else they asked for that you could do."
+
+              private val NOT_LETTERS = Regex("[^\\p{L}\\p{N}]+")
+
+              private val words: List<String> = OwnerLockWords.WORDS.map { letters(it) }.filter { it.length >= 3 }.distinct()
+
+              /** Package name to locked or not, for every app learned or asked about. */
+              private val known = ConcurrentHashMap<String, Boolean>()
+
+              /** False when the list is empty: then nothing is locked and nothing is looked up. */
+              val active: Boolean get() = words.isNotEmpty()
+
+              /** True for a package not yet matched against the installed apps' visible names. */
+              fun unknown(packageName: String): Boolean = active && !known.containsKey(packageName)
+
+              /** Records the installed apps (package name to visible name); [asked] is settled even when it is not among them. */
+              fun learn(apps: Collection<Pair<String, String>>, asked: String? = null) {
+                  if (!active) return
+                  for ((packageName, label) in apps) {
+                      if (known[packageName] != true) known[packageName] = matches(packageName, label)
+                  }
+                  if (asked != null && !known.containsKey(asked)) known[asked] = matches(asked, null)
+              }
+
+              /** True when [packageName] is on the list, by its package name, by [label], or by a name learned earlier. */
+              fun locks(packageName: String?, label: String? = null): Boolean {
+                  if (packageName == null || !active) return false
+                  if (known[packageName] == true) return true
+                  val hit = matches(packageName, label)
+                  if (hit) known[packageName] = true
+                  return hit
+              }
+
+              private fun matches(packageName: String, label: String?): Boolean {
+                  val pkg = packageName.lowercase()
+                  val parts = label?.lowercase()?.split(NOT_LETTERS)?.filter { it.isNotEmpty() }.orEmpty()
+                  return words.any { word -> word in pkg || inName(word, parts) }
+              }
+
+              private fun inName(word: String, parts: List<String>): Boolean =
+                  parts.indices.any { i -> word in parts[i] || parts.subList(i, parts.size).joinToString("").startsWith(word) }
+
+              private fun letters(text: String): String = text.lowercase().filter { it.isLetterOrDigit() }
+          }
+          '''
+
+          HELPER = '''    /** True for an app on the owner's lock list (see [OwnerLock]); app names are read when a new app shows up. */
+              private suspend fun ownerLocked(pkg: String?): Boolean {
+                  if (pkg == null || !OwnerLock.active) return false
+                  if (OwnerLock.unknown(pkg)) OwnerLock.learn(device.installedApps().map { it.packageName to it.label }, pkg)
+                  return OwnerLock.locks(pkg)
+              }
+
+          '''
+
+          # (file, text that must appear exactly once, what replaces it)
+          PATCHES = [
+              (
+                  "agent/ToolExecutor.kt",
+                  "import com.phoneuse.risk.RiskCategory\n",
+                  "import com.phoneuse.risk.RiskCategory\nimport com.phoneuse.security.OwnerLock\n",
+              ),
+              (  # Refuse taps, typing and scrolling while a locked app is in front.
+                  "agent/ToolExecutor.kt",
+                  "(screen.captureBlocked || protectedApps[screen.packageName] == true)\n",
+                  "(screen.captureBlocked || protectedApps[screen.packageName] == true || ownerLocked(screen.packageName))\n",
+              ),
+              (  # Refuse to open a locked app.
+                  "agent/ToolExecutor.kt",
+                  '                val pkg = args.str("package") ?: findPackage(args.str("name") ?: throw ArgException("package or name required"))\n',
+                  '                val pkg = args.str("package") ?: findPackage(args.str("name") ?: throw ArgException("package or name required"))\n'
+                  "                if (ownerLocked(pkg)) throw StepFail(OwnerLock.NOTICE)\n",
+              ),
+              (  # Never publish a locked app's screen: this check runs before any screenshot is taken.
+                  "agent/ToolExecutor.kt",
+                  "        if (protectedApps[pkg] == true) throw WithheldScreen(screen)\n",
+                  "        if (protectedApps[pkg] == true || ownerLocked(pkg)) throw WithheldScreen(screen)\n",
+              ),
+              (  # Tell the model why, in place of the screen.
+                  "agent/ToolExecutor.kt",
+                  "        val notice = if (protectedApps[screen.packageName] == true) PROTECTED else CAPTURE_FAILED\n",
+                  "        val notice = if (OwnerLock.locks(screen.packageName)) OwnerLock.NOTICE\n"
+                  "        else if (protectedApps[screen.packageName] == true) PROTECTED else CAPTURE_FAILED\n",
+              ),
+              (
+                  "agent/ToolExecutor.kt",
+                  "    private suspend fun findPackage(name: String): String {\n",
+                  HELPER + "    private suspend fun findPackage(name: String): String {\n",
+              ),
+              (  # Drop a locked app's notifications before they are stored, so no later feature can read them.
+                  "phone/PhoneUseNotificationListener.kt",
+                  "        if (sbn.packageName == packageName) return null\n",
+                  "        if (sbn.packageName == packageName) return null\n"
+                  "        if (com.phoneuse.security.OwnerLock.locks(sbn.packageName, label(sbn.packageName))) return null\n",
+              ),
+          ]
+
+
+          def main() -> None:
+              words = lock_words()
+
+              security = SRC / "security"
+              (security / "OwnerLock.kt").write_text(OWNER_LOCK, encoding="utf-8")
+              listed = ", ".join(f'"{w}"' for w in words)
+              (security / "OwnerLockWords.kt").write_text(
+                  "package com.phoneuse.security\n\n"
+                  "/** Written by the build from the owner's private list. */\n"
+                  "internal object OwnerLockWords {\n"
+                  f"    val WORDS: List<String> = listOf<String>({listed})\n"
+                  "}\n",
+                  encoding="utf-8",
+              )
+
+              for path, old, new in PATCHES:
+                  file = SRC / path
+                  text = file.read_text(encoding="utf-8")
+                  found = text.count(old)
+                  if found != 1:
+                      stop(f"The lock could not be attached in {path} (expected 1 place, found {found}). The app's code has changed; the lock needs updating.")
+                  file.write_text(text.replace(old, new), encoding="utf-8")
+
+              print(f"Lock attached in {len(PATCHES)} places. Apps on the list: {len(words)}.")
+
+
+          if __name__ == "__main__":
+              main()
+          LOCK_PY
+
+      - name: Build the app
+        run: ./gradlew assembleDebug --console=plain
+
+      - name: Check the app was signed with my key
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          APKSIGNER=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::warning::Could not find the tool that checks the signature, so this check was skipped."
+          else
+            ACTUAL=$("$APKSIGNER" verify --print-certs "$APK" | awk '/certificate SHA-256 digest/ && !seen {print $NF; seen=1}')
+            echo "Expected: $KEY_FINGERPRINT"
+            echo "Actual:   $ACTUAL"
+            if [ "$ACTUAL" != "$KEY_FINGERPRINT" ]; then
+              echo "::error::The app was not signed with my key."
+              exit 1
+            fi
+            echo "Signature matches."
+          fi
+          cp "$APK" "${APP_NAME}.apk"
+
+      - name: Save the app file
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: thonix-app
+          path: ${{ env.APP_NAME }}.apk
+          if-no-files-found: error
+          retention-days: 7
