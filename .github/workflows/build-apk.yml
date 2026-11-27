@@ -8,6 +8,9 @@ permissions:
 
 env:
   APP_NAME: Thonix
+  # Wake word tuning. A higher boost or a lower threshold hears "Hey Thonix" more easily, and misfires more.
+  WAKE_BOOST: "2.0"
+  WAKE_THRESHOLD: "0.15"
 
 jobs:
   build:
@@ -243,6 +246,599 @@ jobs:
           if __name__ == "__main__":
               main()
           LOCK_PY
+
+      # "Hey Thonix": a listener on the phone itself that opens the assistant by voice.
+      - name: Add the wake word listener
+        run: |
+          set -euo pipefail
+          mkdir -p app/libs app/src/main/assets/kws wake-download
+          curl -sSfL --retry 3 -o app/libs/sherpa-onnx.aar "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar"
+          curl -sSfL --retry 3 -o wake-download/model.tar.bz2 "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2"
+          # Only the exact files this listener was tested with are accepted; anything else stops the build.
+          sha256sum -c - <<'SUMS'
+          4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50  app/libs/sherpa-onnx.aar
+          f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a  wake-download/model.tar.bz2
+          SUMS
+          tar xjf wake-download/model.tar.bz2 -C wake-download
+          M=wake-download/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
+          cp "$M/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" app/src/main/assets/kws/encoder.onnx
+          cp "$M/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" app/src/main/assets/kws/decoder.onnx
+          cp "$M/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx" app/src/main/assets/kws/joiner.onnx
+          cp "$M/tokens.txt" app/src/main/assets/kws/tokens.txt
+          rm -rf wake-download
+          python3 - <<'WAKE_PY'
+          """Adds the "Hey Thonix" wake word listener to the app's code before it is built.
+
+          Runs on GitHub during the build, after the engine library and its voice model have
+          been downloaded and checked. Every change to existing code is verified: if the app's
+          code has moved and a change cannot be made in exactly the expected place, the build
+          stops instead of producing an app with a half-attached listener.
+          """
+
+          import os
+          import pathlib
+          import sys
+
+          APP = pathlib.Path("app")
+          SRC = APP / "src/main/java/com/phoneuse"
+
+
+          def stop(message: str) -> None:
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def number(name: str, low: float, high: float) -> str:
+              raw = os.environ.get(name, "").strip()
+              try:
+                  value = float(raw)
+              except ValueError:
+                  stop(f"{name} must be a number, for example 2.0")
+              if not low <= value <= high:
+                  stop(f"{name} must be between {low} and {high}")
+              return f"{value:g}"
+
+
+          # The phrase as the voice model spells it, in the model's own word pieces. Several spellings of the
+          # same sound, because "Thonix" is not a dictionary word. All of them mean the same wake word.
+          SPELLINGS = [
+              "▁HE Y ▁TO N I X",
+              "▁HE Y ▁TO N IC S",
+              "▁HE Y ▁TO N N I X",
+              "▁HE Y ▁TH ON I X",
+              "▁HE Y ▁TH ON IC S",
+              "▁HE Y ▁TH ON N I X",
+          ]
+
+          WAKEWORD = r'''package com.phoneuse.wake
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.SystemClock
+          import android.util.Log
+          import com.phoneuse.assist.PhoneUseVoiceService
+
+          /**
+           * "Hey Thonix": the switch and the shared state of the wake word listener ([WakeWordService]).
+           *
+           * The listener holds the microphone only while it may: the switch is on, the screen is on and unlocked, and
+           * the app's own voice input is not running (two captures at once would silence one of them).
+           */
+          object WakeWord {
+              const val TAG = "WakeWord"
+
+              /** Set on the assistant session's arguments when the wake word opened it, so it listens at once. */
+              const val EXTRA_WAKE = "com.phoneuse.wake.WOKEN"
+
+              private const val PREFS = "wake_word"
+              private const val KEY_ENABLED = "enabled"
+
+              /** How long the listener stays off the microphone after the app's own voice input ends. */
+              private const val AFTER_VOICE_MS = 1_200L
+
+              /** True while the app's own voice input holds the microphone. */
+              @Volatile
+              var voiceBusy = false
+                  private set
+
+              /** The listener stays off the microphone until this moment ([SystemClock.elapsedRealtime]). */
+              @Volatile
+              private var holdUntil = 0L
+
+              /** True while [WakeWordService] is up. */
+              @Volatile
+              var running = false
+                  internal set
+
+              fun enabled(context: Context): Boolean =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
+
+              fun setEnabled(context: Context, on: Boolean) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, on).apply()
+                  if (on) ensureRunning(context) else context.stopService(Intent(context, WakeWordService::class.java))
+              }
+
+              /**
+               * Starts the listener when the switch is on. Safe to call often.
+               *
+               * It starts only while this app is the phone's assistant and may use the microphone: Android lets the
+               * assistant hold the microphone in the background, and a start it would refuse is never attempted.
+               */
+              fun ensureRunning(context: Context) {
+                  if (running || !enabled(context)) return
+                  if (!PhoneUseVoiceService.ready) return
+                  if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+                  try {
+                      context.startForegroundService(Intent(context, WakeWordService::class.java))
+                  } catch (e: RuntimeException) {
+                      // Refused from the background in this state; the next time the assistant opens tries again.
+                      Log.w(TAG, "the listener could not start now", e)
+                  }
+              }
+
+              /** Called by the app's voice input whenever it becomes active or idle. */
+              fun voiceInput(active: Boolean) {
+                  if (voiceBusy && !active) hold(AFTER_VOICE_MS)
+                  voiceBusy = active
+              }
+
+              /** Keeps the listener off the microphone for [ms] from now. */
+              fun hold(ms: Long) {
+                  holdUntil = maxOf(holdUntil, SystemClock.elapsedRealtime() + ms)
+              }
+
+              fun mayListen(): Boolean = !voiceBusy && SystemClock.elapsedRealtime() >= holdUntil
+          }
+          '''
+
+          WAKEWORDSERVICE = r'''package com.phoneuse.wake
+
+          import android.app.KeyguardManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.os.SystemClock
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.util.Log
+          import com.k2fsa.sherpa.onnx.FeatureConfig
+          import com.k2fsa.sherpa.onnx.KeywordSpotter
+          import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
+          import com.k2fsa.sherpa.onnx.OnlineModelConfig
+          import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
+          import com.phoneuse.assist.PhoneUseVoiceService
+
+          /**
+           * Listens for "Hey Thonix" on the device and opens the assistant when it hears it. Nothing it hears leaves the
+           * phone: the audio goes to a small on-device model and is dropped.
+           *
+           * A foreground service of type microphone, with a notification that can turn it off. It listens only while
+           * the screen is on and unlocked, and lets go of the microphone whenever the app's own voice input needs it.
+           */
+          class WakeWordService : Service() {
+              @Volatile
+              private var alive = false
+              private var worker: Thread? = null
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_TURN_OFF) {
+                      WakeWord.setEnabled(applicationContext, false)
+                      return START_NOT_STICKY
+                  }
+                  if (!enterForeground()) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (worker == null) {
+                      alive = true
+                      WakeWord.running = true
+                      worker = Thread({ listen() }, "wake-word").also { it.start() }
+                  }
+                  return START_STICKY
+              }
+
+              /**
+               * A service started with startForegroundService must enter the foreground or Android stops the whole
+               * app. If the microphone type is refused, it enters with the plain type, so it can leave cleanly.
+               */
+              private fun enterForeground(): Boolean {
+                  val notice = notification()
+                  try {
+                      startForeground(NOTIFICATION_ID, notice, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                      return true
+                  } catch (e: RuntimeException) {
+                      Log.w(WakeWord.TAG, "the microphone is not available in the background right now", e)
+                  }
+                  try {
+                      startForeground(NOTIFICATION_ID, notice, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (e: RuntimeException) {
+                      Log.w(WakeWord.TAG, "could not enter the foreground at all", e)
+                  }
+                  return false
+              }
+
+              override fun onDestroy() {
+                  alive = false
+                  WakeWord.running = false
+                  worker?.interrupt()
+                  worker = null
+                  super.onDestroy()
+              }
+
+              private fun listen() {
+                  val spotter = try {
+                      KeywordSpotter(assets, config())
+                  } catch (e: Throwable) {
+                      Log.e(WakeWord.TAG, "the wake word engine did not load", e)
+                      main.post { stopSelf() }
+                      return
+                  }
+                  val power = getSystemService(PowerManager::class.java)
+                  val keyguard = getSystemService(KeyguardManager::class.java)
+                  val pcm = ShortArray(FRAME)
+                  var stream = spotter.createStream()
+                  var recorder: AudioRecord? = null
+                  var usable = false
+                  var checkedAt = 0L
+                  try {
+                      while (alive) {
+                          val now = SystemClock.elapsedRealtime()
+                          if (now - checkedAt >= STATE_CHECK_MS) {
+                              usable = power.isInteractive && !keyguard.isKeyguardLocked
+                              checkedAt = now
+                          }
+                          if (!usable || !WakeWord.mayListen()) {
+                              recorder = close(recorder)
+                              Thread.sleep(IDLE_MS)
+                              continue
+                          }
+                          var mic = recorder
+                          if (mic == null) {
+                              mic = open()
+                              if (mic == null) {
+                                  Thread.sleep(RETRY_MS)
+                                  continue
+                              }
+                              recorder = mic
+                              // What was half heard before the pause must not complete a phrase now.
+                              stream.release()
+                              stream = spotter.createStream()
+                          }
+                          val read = mic.read(pcm, 0, FRAME)
+                          if (read <= 0) {
+                              recorder = close(recorder)
+                              Thread.sleep(RETRY_MS)
+                              continue
+                          }
+                          stream.acceptWaveform(FloatArray(read) { pcm[it] / 32768f }, SAMPLE_RATE)
+                          var heard = false
+                          while (spotter.isReady(stream)) {
+                              spotter.decode(stream)
+                              if (spotter.getResult(stream).keyword.isNotBlank()) {
+                                  heard = true
+                                  spotter.reset(stream)
+                              }
+                          }
+                          if (heard) {
+                              // Off the microphone before the assistant's own voice input opens it.
+                              recorder = close(recorder)
+                              WakeWord.hold(AFTER_WAKE_MS)
+                              main.post { woken() }
+                          }
+                      }
+                  } catch (e: InterruptedException) {
+                      // onDestroy.
+                  } catch (e: RuntimeException) {
+                      Log.e(WakeWord.TAG, "the listener stopped", e)
+                      main.post { stopSelf() }
+                  } finally {
+                      close(recorder)
+                      stream.release()
+                      spotter.release()
+                  }
+              }
+
+              private fun woken() {
+                  buzz()
+                  val shown = PhoneUseVoiceService.show(Bundle().apply { putBoolean(WakeWord.EXTRA_WAKE, true) })
+                  if (!shown) Log.w(WakeWord.TAG, "heard the wake word, but this app is not the phone's assistant")
+              }
+
+              @Suppress("DEPRECATION") // getSystemService(Vibrator) is fine down to minSdk 30.
+              private fun buzz() {
+                  try {
+                      getSystemService(Vibrator::class.java)?.vibrate(VibrationEffect.createOneShot(BUZZ_MS, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } catch (e: RuntimeException) {
+                      // A phone without a vibrator, or one that refuses: the sheet opening is signal enough.
+                  }
+              }
+
+              private fun open(): AudioRecord? {
+                  val smallest = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                  if (smallest <= 0) return null
+                  var mic: AudioRecord? = null
+                  try {
+                      mic = AudioRecord(
+                          MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT, maxOf(smallest, FRAME * 2 * 4),
+                      )
+                      if (mic.state == AudioRecord.STATE_INITIALIZED) {
+                          mic.startRecording()
+                          if (mic.recordingState == AudioRecord.RECORDSTATE_RECORDING) return mic
+                      }
+                  } catch (e: RuntimeException) {
+                      Log.w(WakeWord.TAG, "the microphone could not be opened", e)
+                  }
+                  close(mic)
+                  return null
+              }
+
+              /** Stops and frees [mic]; returns null so the caller can drop its reference in one line. */
+              private fun close(mic: AudioRecord?): AudioRecord? {
+                  if (mic != null) {
+                      try {
+                          if (mic.recordingState == AudioRecord.RECORDSTATE_RECORDING) mic.stop()
+                      } catch (e: RuntimeException) {
+                          // Already stopped.
+                      }
+                      mic.release()
+                  }
+                  return null
+              }
+
+              private fun config() = KeywordSpotterConfig(
+                  featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+                  modelConfig = OnlineModelConfig(
+                      transducer = OnlineTransducerModelConfig(
+                          encoder = "$MODEL_DIR/encoder.onnx",
+                          decoder = "$MODEL_DIR/decoder.onnx",
+                          joiner = "$MODEL_DIR/joiner.onnx",
+                      ),
+                      tokens = "$MODEL_DIR/tokens.txt",
+                      numThreads = 1,
+                      provider = "cpu",
+                      modelType = "zipformer2",
+                  ),
+                  maxActivePaths = 4,
+                  keywordsFile = "$MODEL_DIR/keywords.txt",
+                  numTrailingBlanks = 1,
+              )
+
+              private fun notification(): Notification {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel(CHANNEL, "Wake word", NotificationManager.IMPORTANCE_LOW))
+                  val turnOff = PendingIntent.getService(
+                      this, 0, Intent(this, WakeWordService::class.java).setAction(ACTION_TURN_OFF),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                  )
+                  return Notification.Builder(this, CHANNEL)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("Listening for \"Hey Thonix\"")
+                      .setContentText("Only while the screen is on and unlocked. Nothing heard leaves the phone.")
+                      .setOngoing(true)
+                      .addAction(Notification.Action.Builder(null, "Turn off", turnOff).build())
+                      .build()
+              }
+
+              companion object {
+                  const val ACTION_TURN_OFF = "com.phoneuse.wake.TURN_OFF"
+                  private const val CHANNEL = "wake_word"
+                  private const val NOTIFICATION_ID = 7341
+                  private const val MODEL_DIR = "kws"
+                  private const val SAMPLE_RATE = 16_000
+
+                  /** A tenth of a second of audio per read. */
+                  private const val FRAME = 1_600
+                  private const val IDLE_MS = 300L
+                  private const val RETRY_MS = 1_000L
+                  private const val STATE_CHECK_MS = 1_000L
+
+                  /** Time for the assistant's voice input to open the microphone after a wake. */
+                  private const val AFTER_WAKE_MS = 4_000L
+                  private const val BUZZ_MS = 40L
+              }
+          }
+          '''
+
+          WAKETILESERVICE = r'''package com.phoneuse.wake
+
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          /** The "Hey Thonix" quick settings tile: the on/off switch of the wake word listener. */
+          class WakeTileService : TileService() {
+              override fun onStartListening() {
+                  super.onStartListening()
+                  refresh()
+              }
+
+              override fun onClick() {
+                  super.onClick()
+                  WakeWord.setEnabled(applicationContext, !WakeWord.enabled(applicationContext))
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val tile = qsTile ?: return
+                  tile.state = if (WakeWord.enabled(applicationContext)) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+                  tile.label = "Hey Thonix"
+                  tile.updateTile()
+              }
+          }
+          '''
+
+          PHONEUSEVOICESERVICE = r'''package com.phoneuse.assist
+
+          import android.os.Bundle
+          import android.service.voice.VoiceInteractionService
+          import com.phoneuse.wake.WakeWord
+
+          /**
+           * Makes the app selectable as the default digital assistant (side button long-press); the UI is
+           * [PhoneUseSession]. While it is the assistant it can also open that UI itself, which the wake word uses.
+           */
+          class PhoneUseVoiceService : VoiceInteractionService() {
+              override fun onReady() {
+                  super.onReady()
+                  instance = this
+                  WakeWord.ensureRunning(applicationContext)
+              }
+
+              override fun onShutdown() {
+                  if (instance === this) instance = null
+                  super.onShutdown()
+              }
+
+              companion object {
+                  @Volatile
+                  private var instance: PhoneUseVoiceService? = null
+
+                  /** True while Android has this app bound as the phone's assistant. */
+                  val ready: Boolean get() = instance != null
+
+                  /** Opens the assistant as if the user had called it. False when this app is not the assistant. */
+                  fun show(args: Bundle): Boolean {
+                      val service = instance ?: return false
+                      return try {
+                          service.showSession(args, 0)
+                          true
+                      } catch (e: RuntimeException) {
+                          false
+                      }
+                  }
+              }
+          }
+          '''
+
+
+          MANIFEST_PERMISSIONS = (
+              '    <uses-permission android:name="android.permission.WAKE_LOCK" />\n'
+              "    <!-- Wake word listener (wake.WakeWordService). -->\n"
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />\n'
+              '    <uses-permission android:name="android.permission.VIBRATE" />\n'
+          )
+
+          MANIFEST_SERVICES = """        <service
+                      android:name=".wake.WakeWordService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone|specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Wake word listener; the plain type is only a clean exit when the microphone is refused" />
+                  </service>
+
+                  <service
+                      android:name=".wake.WakeTileService"
+                      android:exported="true"
+                      android:icon="@android:drawable/ic_btn_speak_now"
+                      android:label="Hey Thonix"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter>
+                          <action android:name="android.service.quicksettings.action.QS_TILE" />
+                      </intent-filter>
+                  </service>
+
+          """
+
+          SESSION_SERVICE = '        <service\n            android:name=".assist.PhoneUseSessionService"\n'
+
+          # (file, text that must appear exactly once, what replaces it)
+          PATCHES = [
+              (  # Only the phone's own processor type, so the engine adds one copy of itself, not four.
+                  APP / "build.gradle.kts",
+                  "        minSdk = 30\n",
+                  '        minSdk = 30\n        ndk { abiFilters += listOf("arm64-v8a") }\n',
+              ),
+              (
+                  APP / "build.gradle.kts",
+                  "    implementation(libs.kotlin.reflect)\n",
+                  '    implementation(libs.kotlin.reflect)\n    implementation(files("libs/sherpa-onnx.aar"))\n',
+              ),
+              (
+                  APP / "src/main/AndroidManifest.xml",
+                  '    <uses-permission android:name="android.permission.WAKE_LOCK" />\n',
+                  MANIFEST_PERMISSIONS,
+              ),
+              (
+                  APP / "src/main/AndroidManifest.xml",
+                  SESSION_SERVICE,
+                  MANIFEST_SERVICES + SESSION_SERVICE,
+              ),
+              (  # Woken by voice: start listening at once instead of waiting for a tap on the microphone.
+                  SRC / "assist/PhoneUseSession.kt",
+                  "        super.onShow(args, showFlags)\n        owner.resume()\n",
+                  "        super.onShow(args, showFlags)\n        owner.resume()\n"
+                  "        com.phoneuse.wake.WakeWord.ensureRunning(context)\n"
+                  "        if (args?.getBoolean(com.phoneuse.wake.WakeWord.EXTRA_WAKE) == true) {\n"
+                  "            // Once this call has returned the sheet is up, so hiding it for the voice screen takes effect.\n"
+                  "            android.os.Handler(android.os.Looper.getMainLooper()).post { startVoice(null) }\n"
+                  "        }\n",
+              ),
+              (  # The listener lets go of the microphone whenever the app's own voice input is active.
+                  SRC / "voice/VoiceRecognizer.kt",
+                  "        _state.value = _state.value.reduce(event)\n",
+                  "        _state.value = _state.value.reduce(event)\n"
+                  "        com.phoneuse.wake.WakeWord.voiceInput(_state.value.active)\n",
+              ),
+          ]
+
+
+          def main() -> None:
+              score = number("WAKE_BOOST", 0.5, 5.0)
+              threshold = number("WAKE_THRESHOLD", 0.05, 0.9)
+
+              for needed in ["libs/sherpa-onnx.aar", "src/main/assets/kws/encoder.onnx", "src/main/assets/kws/decoder.onnx",
+                             "src/main/assets/kws/joiner.onnx", "src/main/assets/kws/tokens.txt"]:
+                  if not (APP / needed).is_file():
+                      stop(f"A downloaded file is missing: {needed}")
+
+              keywords = "".join(f"{spelling} :{score} #{threshold} @HEY_THONIX\n" for spelling in SPELLINGS)
+              (APP / "src/main/assets/kws/keywords.txt").write_text(keywords, encoding="utf-8")
+
+              wake = SRC / "wake"
+              wake.mkdir(exist_ok=True)
+              (wake / "WakeWord.kt").write_text(WAKEWORD, encoding="utf-8")
+              (wake / "WakeWordService.kt").write_text(WAKEWORDSERVICE, encoding="utf-8")
+              (wake / "WakeTileService.kt").write_text(WAKETILESERVICE, encoding="utf-8")
+
+              voice_service = SRC / "assist/PhoneUseVoiceService.kt"
+              if voice_service.read_text(encoding="utf-8").count("class PhoneUseVoiceService : VoiceInteractionService()") != 1:
+                  stop("assist/PhoneUseVoiceService.kt is not the file this listener was written for. The app's code has changed; the listener needs updating.")
+              voice_service.write_text(PHONEUSEVOICESERVICE, encoding="utf-8")
+
+              for file, old, new in PATCHES:
+                  text = file.read_text(encoding="utf-8")
+                  found = text.count(old)
+                  if found != 1:
+                      stop(f"The listener could not be wired into {file} (expected 1 place, found {found}). The app's code has changed; the listener needs updating.")
+                  file.write_text(text.replace(old, new), encoding="utf-8")
+
+              print(f"Wake word listener added: 4 files written, {len(PATCHES)} places wired, {len(SPELLINGS)} spellings.")
+
+
+          if __name__ == "__main__":
+              main()
+          WAKE_PY
 
       - name: Build the app
         run: ./gradlew assembleDebug --console=plain
