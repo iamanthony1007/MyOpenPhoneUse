@@ -346,6 +346,13 @@ jobs:
               private const val KEY_ENABLED = "enabled"
               private const val KEY_LEVEL = "level"
               private const val KEY_PROBLEM = "problem"
+              private const val KEY_TAUGHT = "taught"
+
+              /** How many spellings of the owner's own voice are kept. More would crowd the search for the phrase. */
+              const val MAX_TAUGHT = 8
+
+              /** The fewest and most word pieces a heard phrase may have to be saved as the wake word. */
+              private val TEACHABLE = 4..12
 
               /** How long the listener stays off the microphone after the app's own voice input ends. */
               private const val AFTER_VOICE_MS = 1_200L
@@ -387,6 +394,17 @@ jobs:
               @Volatile
               var testing = false
 
+              /**
+               * Status screen only: the last thing the voice model heard, in its own word pieces. Kept in memory while
+               * that screen is open, shown there, and saved nowhere unless the owner taps save.
+               */
+              @Volatile
+              var lastHeard: List<String> = emptyList()
+                  internal set
+
+              @Volatile
+              private var vocabulary: Set<String>? = null
+
               private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
               fun enabled(context: Context): Boolean = prefs(context).getBoolean(KEY_ENABLED, true)
@@ -403,13 +421,70 @@ jobs:
                   val wanted = level.coerceIn(0, LEVELS.lastIndex)
                   if (wanted == level(context)) return
                   prefs(context).edit().putInt(KEY_LEVEL, wanted).apply()
-                  if (running) {
-                      try {
-                          context.startService(Intent(context, WakeWordService::class.java).setAction(WakeWordService.ACTION_RELOAD))
-                      } catch (e: RuntimeException) {
-                          Log.w(TAG, "the new sensitivity will load the next time the listener starts", e)
+                  reload(context)
+              }
+
+              private fun reload(context: Context) {
+                  if (!running) return
+                  try {
+                      context.startService(Intent(context, WakeWordService::class.java).setAction(WakeWordService.ACTION_RELOAD))
+                  } catch (e: RuntimeException) {
+                      Log.w(TAG, "the change will load the next time the listener starts", e)
+                  }
+              }
+
+              /**
+               * The word pieces of the voice model that may go into a spelling: letters only. A piece the model does not
+               * know would stop the engine, and its markers like "<unk>" hold characters the keyword format gives meaning to.
+               */
+              private fun vocabulary(context: Context): Set<String> {
+                  vocabulary?.let { return it }
+                  val read = try {
+                      context.assets.open("kws/tokens.txt").bufferedReader().useLines { lines ->
+                          lines.map { it.substringBefore(' ') }.filter { piece -> piece.any { it in 'A'..'Z' } && piece.all { it in 'A'..'Z' || it == '\'' || it == '\u2581' } }.toSet()
+                      }
+                  } catch (e: java.io.IOException) {
+                      emptySet()
+                  }
+                  vocabulary = read
+                  return read
+              }
+
+              /** A heard piece as the model's files spell it. The engine reports the word-start mark as a space. */
+              internal fun piece(heard: String): String = heard.replace(' ', '\u2581')
+
+              /** Word pieces as readable text: "▁HE Y ▁TO N I X" reads "HEY TONIX". */
+              fun readable(pieces: List<String>): String = pieces.joinToString("").replace('\u2581', ' ').trim()
+
+              /** The owner's own spellings of the phrase, as the model heard them; each is word pieces joined by spaces. */
+              fun taught(context: Context): List<String> {
+                  val known = vocabulary(context)
+                  return (prefs(context).getString(KEY_TAUGHT, "") ?: "").split('\n')
+                      .filter { line -> line.isNotBlank() && line.split(' ').all { it in known } }
+              }
+
+              /** Saves the way the model just heard the owner say the phrase. Returns what to tell them. */
+              fun teach(context: Context, pieces: List<String>): String {
+                  val known = vocabulary(context)
+                  val spelling = pieces.joinToString(" ")
+                  val saved = taught(context)
+                  return when {
+                      pieces.isEmpty() -> "Nothing heard yet. Say \"Hey Thonix\" and wait for it to show above."
+                      pieces.size !in TEACHABLE -> "That was too ${if (pieces.size < TEACHABLE.first) "short" else "long"} to be the phrase. Say only \"Hey Thonix\"."
+                      !pieces.all { it in known } -> "That could not be saved. Say it again."
+                      spelling in saved -> "It heard you the same way as one already saved. That is a good sign."
+                      saved.size >= MAX_TAUGHT -> "$MAX_TAUGHT are saved, which is the most. Forget my voice to start again."
+                      else -> {
+                          prefs(context).edit().putString(KEY_TAUGHT, (saved + spelling).joinToString("\n")).apply()
+                          reload(context)
+                          "Saved. ${saved.size + 1} of your sayings are now the wake word."
                       }
                   }
+              }
+
+              fun forgetTaught(context: Context) {
+                  prefs(context).edit().remove(KEY_TAUGHT).apply()
+                  reload(context)
               }
 
               /** Why the listener is not listening, or null when nothing is known to be wrong. Survives app restarts. */
@@ -484,10 +559,14 @@ jobs:
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.util.Log
+          import com.k2fsa.sherpa.onnx.EndpointConfig
+          import com.k2fsa.sherpa.onnx.EndpointRule
           import com.k2fsa.sherpa.onnx.FeatureConfig
           import com.k2fsa.sherpa.onnx.KeywordSpotter
           import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
           import com.k2fsa.sherpa.onnx.OnlineModelConfig
+          import com.k2fsa.sherpa.onnx.OnlineRecognizer
+          import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
           import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
           import com.phoneuse.assist.PhoneUseVoiceService
           import kotlin.math.abs
@@ -535,7 +614,7 @@ jobs:
                   listener?.stop()
                   WakeWord.running = true
                   WakeWord.state = "Loading the voice engine"
-                  listener = Listener(WakeWord.level(applicationContext)).also { it.start() }
+                  listener = Listener(WakeWord.level(applicationContext), WakeWord.taught(applicationContext)).also { it.start() }
               }
 
               /**
@@ -580,8 +659,11 @@ jobs:
                   }
               }
 
-              /** One run of the listening loop on its own thread, at one sensitivity. Replaced, never reused. */
-              private inner class Listener(private val level: Int) {
+              /** One run of the listening loop on its own thread, at one sensitivity and one set of taught spellings. Replaced, never reused. */
+              private inner class Listener(private val level: Int, taught: List<String>) {
+                  /** The owner's own spellings as extra keywords, at this sensitivity; empty when nothing was taught. */
+                  private val extra = taught.joinToString("/") { "$it :${WakeLevels.BOOST[level]} #${WakeLevels.THRESHOLD[level]} @HEY_THONIX" }
+
                   @Volatile
                   private var alive = true
                   private val thread = Thread({ listen() }, "wake-word")
@@ -607,7 +689,8 @@ jobs:
                       val power = getSystemService(PowerManager::class.java)
                       val keyguard = getSystemService(KeyguardManager::class.java)
                       val pcm = ShortArray(FRAME)
-                      val ears = Ears(spotter)
+                      val ears = Ears(spotter, extra)
+                      var scribe: Scribe? = null
                       var recorder: AudioRecord? = null
                       var usable = false
                       var checkedAt = 0L
@@ -657,7 +740,17 @@ jobs:
                                   say("Listening")
                                   if (silentFrames == 0) WakeWord.report(applicationContext, null)
                               }
-                              if (ears.hear(FloatArray(read) { pcm[it] / 32768f }) && alive) {
+                              val sound = ears.level(FloatArray(read) { pcm[it] / 32768f }) ?: continue
+                              // Writing down what is heard is for the status screen only, and only while it is open.
+                              if (WakeWord.testing) {
+                                  if (scribe == null) scribe = Scribe()
+                                  scribe?.take(sound)
+                              } else if (scribe != null) {
+                                  scribe?.release()
+                                  scribe = null
+                                  WakeWord.lastHeard = emptyList()
+                              }
+                              if (ears.spot(sound) && alive) {
                                   ears.fresh()
                                   WakeWord.heard += 1
                                   WakeWord.heardAt = SystemClock.elapsedRealtime()
@@ -677,6 +770,7 @@ jobs:
                           failed(this, "The listener stopped unexpectedly. (${WakeWord.describe(e)})")
                       } finally {
                           close(recorder)
+                          scribe?.release()
                           ears.release()
                           spotter.release()
                       }
@@ -694,8 +788,11 @@ jobs:
                * after about two seconds without speech, and a phrase that begins just before that is lost. With listens
                * started a third of that time apart, a phrase always falls well inside at least one of them.
                */
-              private class Ears(private val spotter: KeywordSpotter) {
-                  private val streams = Array(LISTENS) { spotter.createStream() }
+              private class Ears(private val spotter: KeywordSpotter, private val extra: String) {
+                  private val streams = Array(LISTENS) { stream() }
+
+                  /** A new listen for the built-in spellings plus the owner's own. */
+                  private fun stream() = if (extra.isEmpty()) spotter.createStream() else spotter.createStream(extra)
 
                   /** Samples each listen has taken in its current life; below zero while it waits for its staggered start. */
                   private val taken = IntArray(LISTENS)
@@ -714,7 +811,7 @@ jobs:
                   fun fresh() {
                       for (i in streams.indices) {
                           streams[i].release()
-                          streams[i] = spotter.createStream()
+                          streams[i] = stream()
                       }
                       stagger()
                       ahead.clear()
@@ -725,18 +822,26 @@ jobs:
                       for (stream in streams) stream.release()
                   }
 
-                  /** Takes the next stretch of sound, samples from -1 to 1. True when the phrase was heard. */
-                  fun hear(frame: FloatArray): Boolean {
+                  /**
+                   * Takes the next stretch of sound, samples from -1 to 1, and gives back the stretch from a few frames
+                   * earlier, levelled. Null while the look-ahead is still filling.
+                   */
+                  fun level(frame: FloatArray): FloatArray? {
                       var peak = 0f
                       for (sample in frame) peak = maxOf(peak, abs(sample))
                       loudest = maxOf(peak, loudest * FADE)
                       ahead.addLast(frame)
-                      if (ahead.size <= LOOK_AHEAD) return false
+                      if (ahead.size <= LOOK_AHEAD) return null
                       val due = ahead.removeFirst()
                       val gain = if (loudest > 0f) (FULL / loudest).coerceIn(1f, MOST_GAIN) else 1f
                       if (gain != 1f) for (i in due.indices) due[i] = (due[i] * gain).coerceIn(-1f, 1f)
+                      return due
+                  }
+
+                  /** Gives levelled sound to every listen. True when the phrase was heard. */
+                  fun spot(sound: FloatArray): Boolean {
                       var heard = false
-                      for (i in streams.indices) if (give(i, due)) heard = true
+                      for (i in streams.indices) if (give(i, sound)) heard = true
                       return heard
                   }
 
@@ -762,11 +867,47 @@ jobs:
                           }
                           if (taken[index] >= LIFE) {
                               stream.release()
-                              streams[index] = spotter.createStream()
+                              streams[index] = stream()
                               taken[index] = 0
                           }
                       }
                       return heard
+                  }
+              }
+
+              /**
+               * Writes down what the voice model hears, in its own word pieces, for the status screen: to show what it
+               * makes of a voice, and so the owner can save the way they say the phrase. Same model files as the listener.
+               */
+              private inner class Scribe {
+                  private val recognizer = OnlineRecognizer(
+                      assets,
+                      OnlineRecognizerConfig(
+                          featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
+                          modelConfig = model(),
+                          endpointConfig = EndpointConfig(
+                              rule1 = EndpointRule(false, 2.4f, 0f),
+                              rule2 = EndpointRule(true, SAID_PAUSE_S, 0f),
+                              rule3 = EndpointRule(false, 0f, 20f),
+                          ),
+                          enableEndpoint = true,
+                          decodingMethod = "greedy_search",
+                      ),
+                  )
+                  private val stream = recognizer.createStream()
+
+                  fun take(sound: FloatArray) {
+                      stream.acceptWaveform(sound, SAMPLE_RATE)
+                      while (recognizer.isReady(stream)) recognizer.decode(stream)
+                      val pieces = recognizer.getResult(stream).tokens.map { WakeWord.piece(it) }.filter { piece -> piece.any { it in 'A'..'Z' } }
+                      // The last thing said stays on screen until something new is said.
+                      if (pieces.isNotEmpty()) WakeWord.lastHeard = pieces
+                      if (recognizer.isEndpoint(stream)) recognizer.reset(stream)
+                  }
+
+                  fun release() {
+                      stream.release()
+                      recognizer.release()
                   }
               }
 
@@ -820,20 +961,22 @@ jobs:
                   return null
               }
 
+              private fun model() = OnlineModelConfig(
+                  transducer = OnlineTransducerModelConfig(
+                      encoder = "$MODEL_DIR/encoder.onnx",
+                      decoder = "$MODEL_DIR/decoder.onnx",
+                      joiner = "$MODEL_DIR/joiner.onnx",
+                  ),
+                  tokens = "$MODEL_DIR/tokens.txt",
+                  numThreads = 1,
+                  provider = "cpu",
+                  modelType = "zipformer2",
+              )
+
               private fun config(level: Int) = KeywordSpotterConfig(
                   featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
-                  modelConfig = OnlineModelConfig(
-                      transducer = OnlineTransducerModelConfig(
-                          encoder = "$MODEL_DIR/encoder.onnx",
-                          decoder = "$MODEL_DIR/decoder.onnx",
-                          joiner = "$MODEL_DIR/joiner.onnx",
-                      ),
-                      tokens = "$MODEL_DIR/tokens.txt",
-                      numThreads = 1,
-                      provider = "cpu",
-                      modelType = "zipformer2",
-                  ),
-                  maxActivePaths = 4,
+                  modelConfig = model(),
+                  maxActivePaths = SEARCH_PATHS,
                   keywordsFile = "$MODEL_DIR/keywords-$level.txt",
                   numTrailingBlanks = 1,
               )
@@ -880,6 +1023,12 @@ jobs:
                   private const val FADE = 0.98f
                   private const val FULL = 0.5f
                   private const val MOST_GAIN = 30f
+
+                  /** How many candidate hearings the search keeps at once. Measured: 4 loses real hits that 16 keeps, at no cost in speed. */
+                  private const val SEARCH_PATHS = 16
+
+                  /** Seconds of quiet after speech before the status screen treats a saying as finished. */
+                  private const val SAID_PAUSE_S = 0.8f
 
                   /** Time for the assistant's voice input to open the microphone after a wake. */
                   private const val AFTER_WAKE_MS = 4_000L
@@ -942,6 +1091,10 @@ jobs:
               private var loudest = 0
               private var loudestAt = 0L
               private lateinit var heard: TextView
+              private lateinit var itHeard: TextView
+              private lateinit var teachNote: TextView
+              private lateinit var voices: TextView
+              private lateinit var forget: Button
               private lateinit var levelName: TextView
               private lateinit var levelBar: SeekBar
 
@@ -970,6 +1123,23 @@ jobs:
                   column.addView(meter, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(28)))
                   loudness = text(column, 13f)
                   heard = text(column, 20f, bold = true)
+
+                  heading(column, "Teach it your voice")
+                  text(column, 15f).text = "If it does not hear you: say \"Hey Thonix\", wait until what it heard shows below, then tap Save. " +
+                      "Do this five times. It learns the way you say it."
+                  itHeard = text(column, 20f, bold = true)
+                  button(column, "Save that as my wake word") {
+                      teachNote.text = WakeWord.teach(this, WakeWord.lastHeard)
+                      WakeWord.lastHeard = emptyList()
+                      refresh()
+                  }
+                  teachNote = text(column, 15f)
+                  voices = text(column, 15f)
+                  forget = button(column, "Forget my voice") {
+                      WakeWord.forgetTaught(this)
+                      teachNote.text = "Forgotten. Only the built-in spellings are used now."
+                      refresh()
+                  }
 
                   heading(column, "Sensitivity")
                   levelName = text(column, 15f)
@@ -1060,6 +1230,17 @@ jobs:
                       else -> "Heard: $count  (last ${(SystemClock.elapsedRealtime() - WakeWord.heardAt) / 1000} s ago)"
                   }
                   showLevel()
+
+                  val said = WakeWord.lastHeard
+                  itHeard.text = if (said.isEmpty()) "It heard: nothing yet" else "It heard: ${WakeWord.readable(said)}"
+                  teachNote.visibility = if (teachNote.text.isEmpty()) View.GONE else View.VISIBLE
+                  val taught = WakeWord.taught(this)
+                  voices.text = if (taught.isEmpty()) {
+                      "Your voice: nothing saved yet"
+                  } else {
+                      "Your voice (${taught.size} saved): " + taught.joinToString("  \u00b7  ") { WakeWord.readable(it.split(' ')) }
+                  }
+                  forget.visibility = if (taught.isEmpty()) View.GONE else View.VISIBLE
 
                   checks.text = listOf(
                       mark(on) + "The switch is on",
@@ -1302,6 +1483,16 @@ jobs:
               (wake / "WakeWordService.kt").write_text(WAKEWORDSERVICE, encoding="utf-8")
               (wake / "WakeStatusActivity.kt").write_text(WAKESTATUSACTIVITY, encoding="utf-8")
               (wake / "WakeTileService.kt").write_text(WAKETILESERVICE, encoding="utf-8")
+              quoted = lambda column: ", ".join(f'"{level[column]}"' for level in LEVELS)
+              (wake / "WakeLevels.kt").write_text(
+                  "package com.phoneuse.wake\n\n"
+                  "/** Written at build time from the same table that makes the keyword files, so the two cannot disagree. */\n"
+                  "internal object WakeLevels {\n"
+                  f"    val BOOST = listOf({quoted(1)})\n"
+                  f"    val THRESHOLD = listOf({quoted(2)})\n"
+                  "}\n",
+                  encoding="utf-8",
+              )
 
               voice_service = SRC / "assist/PhoneUseVoiceService.kt"
               if voice_service.read_text(encoding="utf-8").count("class PhoneUseVoiceService : VoiceInteractionService()") != 1:
@@ -1315,7 +1506,7 @@ jobs:
                       stop(f"The listener could not be wired into {file} (expected 1 place, found {found}). The app's code has changed; the listener needs updating.")
                   file.write_text(text.replace(old, new), encoding="utf-8")
 
-              print(f"Wake word listener added: 5 files written, {len(PATCHES)} places wired, {len(LEVELS)} sensitivity settings.")
+              print(f"Wake word listener added: 6 files written, {len(PATCHES)} places wired, {len(LEVELS)} sensitivity settings.")
 
 
           if __name__ == "__main__":
